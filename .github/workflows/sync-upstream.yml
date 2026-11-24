@@ -31,17 +31,23 @@ concurrency:
 
 jobs:
   sync:
-    # Scheduled sync is enabled automatically on forks. Manual sync is restricted to main.
+    name: Prepare upstream candidate PR
     if: >-
+      github.repository == 'xiongmx/CloudSSH' &&
       github.event.repository.fork == true &&
       (github.event_name == 'schedule' ||
        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
 
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
       - name: Create GitHub App token
         id: app-token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
@@ -51,62 +57,272 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: CloudSSH
           permission-contents: write
-          permission-workflows: write
+          permission-pull-requests: write
 
-      - name: Sync main branch from upstream
+      - name: Merge upstream into a new candidate branch and open a PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
 
           error_file="$(mktemp)"
-          trap 'rm -f "$error_file"' EXIT
+          branch=""
+          candidate_ref_created=false
+          keep_candidate=false
+          cleanup() {
+            if [[ "$candidate_ref_created" == "true" && "$keep_candidate" != "true" ]]; then
+              gh api --method DELETE "repos/${REPOSITORY}/git/refs/heads/${branch}" >/dev/null 2>&1 || true
+            fi
+            rm -f "$error_file"
+          }
+          trap cleanup EXIT
 
-          if ! response=$(gh api \
-            --method POST \
-            "repos/${REPOSITORY}/merge-upstream" \
-            -f branch=main 2>"$error_file"); then
-            cat "$error_file" >&2
-            echo "::error title=上游同步失败::GitHub 拒绝同步请求；不会自动选择冲突版本，也不会部署未同步代码。"
+          upstream_repository="$(gh api "repos/${REPOSITORY}" --jq '.parent.full_name // empty')"
+          upstream_branch="$(gh api "repos/${REPOSITORY}" --jq '.parent.default_branch // empty')"
+          if [[ "$upstream_repository" != "newbietan/CloudSSH" || "$upstream_branch" != "main" ]]; then
+            echo "::error title=上游来源不匹配::预期上游为 newbietan/CloudSSH:main；不会创建候选分支或 PR。"
+            exit 1
+          fi
+
+          git remote add upstream "https://github.com/${upstream_repository}.git"
+          git fetch --no-tags origin main
+          git fetch --no-tags upstream "refs/heads/${upstream_branch}:refs/remotes/upstream/${upstream_branch}"
+          base_sha="$(git rev-parse 'refs/remotes/origin/main^{commit}')"
+          upstream_sha="$(git rev-parse "refs/remotes/upstream/${upstream_branch}^{commit}")"
+          current_main_sha="$(gh api "repos/${REPOSITORY}/branches/main" --jq '.commit.sha')"
+          if [[ "$base_sha" != "$current_main_sha" ]]; then
+            echo "::error title=main 已变化::取到的 main 与 GitHub 最新 SHA 不一致；本次停止，等待下一轮重新取样。"
+            exit 1
+          fi
+          if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ && "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=提交 SHA 无效::上游或 main 未返回完整提交 SHA；不会创建候选 PR。"
+            exit 1
+          fi
+
+          if git merge-base --is-ancestor "$upstream_sha" "$base_sha"; then
+            echo "::notice title=上游同步::main 已包含上游最新提交，无需候选 PR。"
             {
               echo "## 上游同步结果"
               echo
-              echo "- 状态：同步失败，main 未能完成上游合并"
-              echo "- 处理：检查冲突路径或 GitHub App 权限；同步失败不会触发生产部署"
+              echo "- 状态：main 已包含上游最新提交；未创建候选分支、未更新 main。"
+              echo "- main SHA：\`${base_sha}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          merge_base="$(git merge-base "$base_sha" "$upstream_sha")" || {
+            echo "::error title=上游历史不兼容::main 与上游没有可确认的共同祖先；不会覆盖或重写任何分支。"
+            exit 1
+          }
+
+          open_candidates="$(gh api "repos/${REPOSITORY}/pulls?state=open&base=main&per_page=100" | jq -c --arg repo "$REPOSITORY" '[.[] | select(.head.repo.full_name == $repo and (.head.ref | startswith("automation-upstream-sync-"))) | {number: .number, head_ref: .head.ref, head_sha: .head.sha, base_sha: .base.sha}]')"
+          if [[ "$(jq 'length' <<< "$open_candidates")" -gt 0 ]]; then
+            candidate_numbers="$(jq -r '[.[].number] | join(", ")' <<< "$open_candidates")"
+            echo "::notice title=候选 PR 已存在::发现未关闭的自动同步 PR #${candidate_numbers}；不会创建、覆盖或更新候选分支。"
+            {
+              echo "## 上游同步结果"
+              echo
+              echo "- 状态：已有待处理候选 PR（#${candidate_numbers}）；本轮不改变其内容。"
+              echo "- 处理：PR 工作流将独立验证；失败或 SHA 过期时不会晋级到 main。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          protected_changes="$(git diff --name-only "$merge_base" "$upstream_sha" -- .github/ scripts/ci-test-e2e.mjs tests/workflow-policy.test.ts)"
+          if [[ -n "$protected_changes" ]]; then
+            echo "::error title=上游修改了 CI 门禁文件::为避免上游同步改写测试或部署门禁，本轮停止且不创建 PR。"
+            printf '%s\n' "$protected_changes" >&2
+            {
+              echo "## 上游同步结果"
+              echo
+              echo "- 状态：失败关闭；上游改动了受保护的工作流或 CI 策略文件。"
+              echo "- 受影响路径："
+              while IFS= read -r path; do printf '  - `%s`\n' "$path"; done <<< "$protected_changes"
+              echo "- 处理：需人工审查这些 CI 门禁改动后再同步。"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
-          if [[ -s "$error_file" ]]; then
+          branch="automation-upstream-sync-${upstream_sha:0:12}-${base_sha:0:12}-${RUN_ID}"
+          if ! gh api --method POST "repos/${REPOSITORY}/git/refs" \
+            -f "ref=refs/heads/${branch}" -f "sha=${base_sha}" > /dev/null 2>"$error_file"; then
             cat "$error_file" >&2
+            echo "::error title=候选分支创建失败::GitHub 未创建候选分支；main 未改变。"
+            exit 1
+          fi
+          candidate_ref_created=true
+
+          if ! merge_response="$(gh api --method POST "repos/${REPOSITORY}/merge-upstream" \
+            -f "branch=${branch}" 2>"$error_file")"; then
+            cat "$error_file" >&2
+            echo "::error title=上游合并冲突::候选分支同步失败；main 未改变，也不会自动选择冲突版本。"
+            {
+              echo "## 上游同步结果"
+              echo
+              echo "- 状态：候选分支合并失败（冲突或 GitHub API 错误）；main 未改变。"
+              echo "- 处理：检查冲突路径或 GitHub App 权限；不会自动覆盖冲突文件。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          git fetch --no-tags upstream "refs/heads/${upstream_branch}:refs/remotes/upstream/${upstream_branch}"
+          latest_upstream_sha="$(git rev-parse "refs/remotes/upstream/${upstream_branch}^{commit}")"
+          candidate_sha="$(gh api "repos/${REPOSITORY}/git/ref/heads/${branch}" --jq '.object.sha')"
+          candidate_commit="$(gh api "repos/${REPOSITORY}/commits/${candidate_sha}")"
+          parent_count="$(jq '.parents | length' <<< "$candidate_commit")"
+          if [[ "$latest_upstream_sha" != "$upstream_sha" ]]; then
+            echo "::error title=上游 SHA 已变化::同步过程中上游更新了；丢弃候选分支，等待下一轮重新取样。"
+            exit 1
+          fi
+          if [[ "$candidate_sha" == "$upstream_sha" ]]; then
+            git merge-base --is-ancestor "$base_sha" "$upstream_sha" || {
+              echo "::error title=候选提交校验失败::上游快进结果与已观察的 main 不匹配。"
+              exit 1
+            }
+          else
+            parent_one="$(jq -r '.parents[0].sha // empty' <<< "$candidate_commit")"
+            parent_two="$(jq -r '.parents[1].sha // empty' <<< "$candidate_commit")"
+            if [[ "$parent_count" != 2 || "$parent_one" != "$base_sha" || "$parent_two" != "$upstream_sha" ]]; then
+              echo "::error title=候选提交校验失败::候选分支的父提交与已观察的 main/upstream SHA 不一致。"
+              exit 1
+            fi
+          fi
+
+          current_main_sha="$(gh api "repos/${REPOSITORY}/branches/main" --jq '.commit.sha')"
+          if [[ "$current_main_sha" != "$base_sha" ]]; then
+            echo "::error title=main 已变化::候选生成期间 main 前进；丢弃候选分支，等待下一轮重新取样。"
+            exit 1
+          fi
+
+          pr_body="$(printf '自动生成的上游候选变更。\n\n- Base-SHA：`%s`\n- Upstream-SHA：`%s`\n- Candidate-SHA：`%s`\n\n该 PR 必须通过受保护的完整 CI；只有在测试、main SHA 和候选 SHA 均仍匹配时才会自动合并。' "$base_sha" "$upstream_sha" "$candidate_sha")"
+          if ! pr_url="$(gh pr create --repo "$REPOSITORY" --base main --head "${OWNER}:${branch}" \
+            --title "Sync upstream ${upstream_sha:0:12}" --body "$pr_body" 2>"$error_file")"; then
+            cat "$error_file" >&2
+            echo "::error title=候选 PR 创建失败::候选分支未晋级；main 未改变。"
+            exit 1
+          fi
+          keep_candidate=true
+          pr_number="$(gh pr view "$pr_url" --repo "$REPOSITORY" --json number --jq '.number')"
+          merge_type="$(jq -r '.merge_type // "unknown"' <<< "$merge_response")"
+          {
+            echo "## 上游候选 PR"
+            echo
+            echo "- PR：#${pr_number}"
+            echo "- 上游分支：\`${upstream_repository}:${upstream_branch}\`"
+            echo "- 上游 SHA：\`${upstream_sha}\`"
+            echo "- main 基线 SHA：\`${base_sha}\`"
+            echo "- GitHub 合并类型：\`${merge_type}\`"
+            echo "- 状态：仅更新候选分支；main 与生产 Worker 尚未改变。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=上游候选 PR::已创建 PR #${pr_number}；等待完整 CI。"
+
+  promote-upstream:
+    name: Promote tested upstream candidate
+    needs: verify-and-deploy
+    if: >-
+      needs.verify-and-deploy.result == 'success' &&
+      github.repository == 'xiongmx/CloudSSH' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'automation-upstream-sync-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Create scoped GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ secrets.CLOUDSSH_SYNC_APP_ID }}
+          private-key: ${{ secrets.CLOUDSSH_SYNC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: CloudSSH
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Recheck the exact tested PR and merge it
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          TESTED_MERGE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=候选 PR 未晋级::$1"; exit 1; }
+
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || fail "PR 编号无效。"
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "PR head SHA 无效。"
+          [[ "$EXPECTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "PR base SHA 无效。"
+          [[ "$TESTED_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "测试合并 SHA 无效。"
+          if [[ "$EXPECTED_HEAD_REF" =~ ^automation-upstream-sync-([0-9a-f]{12})-([0-9a-f]{12})-[0-9]+$ ]]; then
+            upstream_prefix="${BASH_REMATCH[1]}"
+            base_prefix="${BASH_REMATCH[2]}"
+          else
+            fail "PR 分支名不符合自动同步候选格式。"
+          fi
+          [[ "${EXPECTED_BASE_SHA:0:12}" == "$base_prefix" ]] || fail "候选分支记录的 main 基线与本次测试不匹配。"
+
+          pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          [[ "$(jq -r '.state' <<< "$pr_json")" == "open" ]] || fail "PR 已关闭或已合并。"
+          [[ "$(jq -r '.merged' <<< "$pr_json")" == "false" ]] || fail "PR 已被其他操作合并。"
+          [[ "$(jq -r '.user.type' <<< "$pr_json")" == "Bot" ]] || fail "PR 作者不是自动化 Bot。"
+          [[ "$(jq -r '.base.repo.full_name' <<< "$pr_json")" == "$REPOSITORY" ]] || fail "PR base 仓库不匹配。"
+          [[ "$(jq -r '.base.ref' <<< "$pr_json")" == "main" ]] || fail "PR 目标不是 main。"
+          [[ "$(jq -r '.head.repo.full_name' <<< "$pr_json")" == "$REPOSITORY" ]] || fail "PR head 不在本仓库。"
+          [[ "$(jq -r '.head.ref' <<< "$pr_json")" == "$EXPECTED_HEAD_REF" ]] || fail "PR head 分支已变化。"
+          [[ "$(jq -r '.head.sha' <<< "$pr_json")" == "$EXPECTED_HEAD_SHA" ]] || fail "PR head SHA 已变化；旧测试结果不能晋级。"
+          [[ "$(jq -r '.base.sha' <<< "$pr_json")" == "$EXPECTED_BASE_SHA" ]] || fail "PR base SHA 已变化；旧测试结果不能晋级。"
+
+          current_main_sha="$(gh api "repos/${REPOSITORY}/branches/main" --jq '.commit.sha')"
+          [[ "$current_main_sha" == "$EXPECTED_BASE_SHA" ]] || fail "main 在测试期间前进；需要基于新 main 重新测试。"
+
+          tested_commit="$(gh api "repos/${REPOSITORY}/commits/${TESTED_MERGE_SHA}")"
+          [[ "$(jq -r '.parents[0].sha // empty' <<< "$tested_commit")" == "$EXPECTED_BASE_SHA" ]] || fail "CI 测试的合并树不以当前 main 为父提交。"
+          [[ "$(jq -r '.parents[1].sha // empty' <<< "$tested_commit")" == "$EXPECTED_HEAD_SHA" ]] || fail "CI 测试的合并树不包含当前 PR head。"
+
+          head_commit="$(gh api "repos/${REPOSITORY}/commits/${EXPECTED_HEAD_SHA}")"
+          parent_count="$(jq '.parents | length' <<< "$head_commit")"
+          if [[ "$parent_count" == 2 ]]; then
+            [[ "$(jq -r '.parents[0].sha' <<< "$head_commit")" == "$EXPECTED_BASE_SHA" ]] || fail "候选 merge commit 的第一父提交不是受测 main。"
+            upstream_sha="$(jq -r '.parents[1].sha' <<< "$head_commit")"
+          elif [[ "$parent_count" == 1 ]]; then
+            upstream_sha="$EXPECTED_HEAD_SHA"
+            comparison="$(gh api "repos/${REPOSITORY}/compare/${EXPECTED_BASE_SHA}...${EXPECTED_HEAD_SHA}" --jq '.status')"
+            [[ "$comparison" == "ahead" ]] || fail "候选快进提交并非基于受测 main。"
+          else
+            fail "候选提交不是受支持的上游合并或快进结果。"
+          fi
+          [[ "${upstream_sha:0:12}" == "$upstream_prefix" ]] || fail "候选提交中的上游 SHA 与分支标记不匹配。"
+
+          error_file="$(mktemp)"
+          if ! merge_response="$(gh api --method PUT "repos/${REPOSITORY}/pulls/${PR_NUMBER}/merge" \
+            -f "sha=${EXPECTED_HEAD_SHA}" -f merge_method=merge 2>"$error_file")"; then
+            merged="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.merged // false' 2>/dev/null || echo false)"
+            if [[ "$merged" != "true" ]]; then
+              cat "$error_file" >&2
+              rm -f "$error_file"
+              fail "GitHub 拒绝合并；候选 PR 保持未合并，main 未被绕过。"
+            fi
           fi
           rm -f "$error_file"
-          trap - EXIT
-
-          merge_type=$(jq -r '.merge_type // "unknown"' <<< "$response")
-          base_branch=$(jq -r '.base_branch // "unknown"' <<< "$response")
-          case "$merge_type" in
-            none)
-              result="当前 main 分支未落后于上游，无需同步"
-              ;;
-            fast-forward|merge)
-              result="已成功同步上游更新"
-              ;;
-            *)
-              result="GitHub 已完成同步请求"
-              ;;
-          esac
-
-          echo "上游分支：${base_branch}"
-          echo "同步结果：${result}"
-          echo "::notice title=上游同步::${result}"
+          echo "::notice title=上游候选已通过测试::已通过当前 PR SHA 与 main SHA 核验，并按受保护分支规则合并。"
           {
-            echo "## 上游同步结果"
+            echo "## 上游自动晋级"
             echo
-            echo "- 上游分支：\`${base_branch}\`"
-            echo "- 状态：${result}"
-            echo "- 若 main 有新提交，后续 push 运行会先完成验证，再部署生产 Worker"
+            echo "- PR：#${PR_NUMBER}"
+            echo "- 测试的 PR head：\`${EXPECTED_HEAD_SHA}\`"
+            echo "- 测试的 main 基线：\`${EXPECTED_BASE_SHA}\`"
+            echo "- 状态：全量 CI 通过，SHA 未变化，已按 branch protection 合并。"
           } >> "$GITHUB_STEP_SUMMARY"
 
   verify-and-deploy:
@@ -125,7 +341,21 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 0
+
+      - name: Verify pull request merge commit parents
+        if: github.event_name == 'pull_request'
+        env:
+          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          actual_base="$(git rev-parse HEAD^1)"
+          actual_head="$(git rev-parse HEAD^2)"
+          if [[ "$actual_base" != "$EXPECTED_BASE_SHA" || "$actual_head" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "::error title=测试提交已变化::当前检出的 PR 合并提交不匹配本次事件中的 base/head SHA。"
+            exit 1
+          fi
 
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
