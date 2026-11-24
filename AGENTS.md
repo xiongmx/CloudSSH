@@ -278,18 +278,22 @@ Four Durable Objects handle state:
 
 ## Environment Variables
 
-Required for optional features (configured in `wrangler.toml` or Cloudflare Dashboard):
+Worker runtime variables and secrets are configured in the Cloudflare Dashboard. This fork sets
+`keep_vars = true` in `wrangler.toml` and intentionally does not track `[vars]` values, so
+upstream syncs and deploys preserve dashboard-managed settings. Do not add personal Worker
+parameter values or secrets to the repository; use Cloudflare Secret bindings for sensitive data.
 
 - `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` - GitHub OAuth
 - `GITHUB_ALLOWED_USER_IDS` - Optional comma-separated numeric GitHub user ID allowlist; omitted means unrestricted GitHub login
-- `REQUIRE_AUTH` - Optional; `true` disables anonymous SSH and requires a valid login regardless of the authentication provider. wrangler.toml `[vars]` 默认下发 `"false"`（`[env.test.vars]` 默认 `"true"`：测试环境部署即要求登录），自定义请改配置文件
+- `REQUIRE_AUTH` - Optional; when enabled, disables anonymous SSH and requires a valid login regardless of the authentication provider
+- `ENABLE_SSH_SHARING` - Optional; controls one-time SSH sharing
 - `TURNSTILE_SECRET` / `TURNSTILE_SITEKEY` - Bot verification（默认不部署，用户自行选择加入；经 Git/CLI 部署的实例建议 SECRET 用 Dashboard Secret 类型——Secret 不受 wrangler 部署覆盖）
 - `BASE_URL` - OAuth callback URL
-- `DEBUG_MODE` - Optional; `true` appends debug info to API responses（wrangler.toml `[vars]` 已声明 `DEBUG_MODE`）
-- `IDLE_TIMEOUT` - Optional; user inactivity idle timeout duration (e.g. `30m`, `1h`, `1800`; defaults to `30m`; `0` disables idle timeout)。wrangler.toml `[vars]` 默认下发 `"30m"`，自定义请改配置文件
+- `DEBUG_MODE` - Optional; enables debug details in API responses
+- `IDLE_TIMEOUT` - Optional; user inactivity idle timeout duration (e.g. `30m`, `1h`, `1800`; `0` disables idle timeout)
 - `ADMIN_PASSWORD_HASH` - Optional; 单管理员密码登录（`pbkdf2$sha256$<iterations>$<salt>$<verifier>`）。生成方式：部署后站点页脚「管理员密码登录设置」浏览器内生成（主路径，无需本地工具）或 `pnpm run hash-password`。非空即启用密码模式：与 GitHub OAuth 互斥且优先级更高，全实例仅本地管理员一个账号；置空/删除即刻退回 GitHub 模式
 
-> `IDLE_TIMEOUT` 默认 30 分钟。wrangler 以 wrangler.toml 为配置权威：部署会覆盖 Dashboard 同名普通变量，不影响 Secret；`IDLE_TIMEOUT` / `REQUIRE_AUTH` 随 `[vars]` 默认下发。
+> Wrangler normally treats its configuration as authoritative and can overwrite dashboard variables. The `keep_vars` setting above preserves variables configured in Cloudflare; encrypted Worker secrets remain preserved by Wrangler deployments.
 
 ## API Routes
 

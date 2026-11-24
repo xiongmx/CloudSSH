@@ -39,18 +39,20 @@ describe('Fork 工作流执行策略', () => {
     expect(deploy).not.toMatch(/run: pnpm run test:e2e[^\n]*\|\|/);
   });
 
-  it('Fork 可直接手动同步，定时同步需要显式开启', () => {
+  it('Fork 定时自动同步，冲突失败关闭且不自动覆盖', () => {
     const sync = readWorkflow('sync-upstream.yml');
     expect(sync).toMatch(/^  workflow_dispatch:$/m);
     expect(sync).toMatch(/^  schedule:$/m);
-    expect(sync).toContain(
-      `    if: >-
-      github.event.repository.fork == true &&
-      (github.event_name == 'workflow_dispatch' || vars.AUTO_SYNC_UPSTREAM == 'true')
-`
-    );
+    expect(sync).toContain('  pull_request:\n    branches: [main]');
+    expect(sync).toContain('  push:\n    branches: [main]');
+    expect(sync).toContain('github.event.repository.fork == true');
+    expect(sync).toContain("github.event_name == 'schedule'");
+    expect(sync).toContain("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'");
+    expect(sync).not.toContain('AUTO_SYNC_UPSTREAM');
     expect(sync).toContain('"repos/${REPOSITORY}/merge-upstream"');
     expect(sync).toContain('-f branch=main');
+    expect(sync).toContain('::error title=上游同步失败');
+    expect(sync).toContain('不会自动选择冲突版本');
     expect(sync).toContain('uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349');
     expect(sync).toContain('secrets.CLOUDSSH_SYNC_APP_ID');
     expect(sync).toContain('secrets.CLOUDSSH_SYNC_APP_PRIVATE_KEY');
@@ -59,6 +61,29 @@ describe('Fork 工作流执行策略', () => {
     expect(sync).toContain('permission-workflows: write');
     expect(sync).toContain('GH_TOKEN: ${{ steps.app-token.outputs.token }}');
     expect(sync).not.toMatch(/secrets\.(?:GITHUB_TOKEN|GH_TOKEN|PERSONAL_ACCESS_TOKEN|PAT)\b/);
+  });
+
+  it('xiongmx 先完成全量验证，只有通过验证的 main push 部署并保留 Dashboard 参数', () => {
+    const sync = readWorkflow('sync-upstream.yml');
+    const deploy = sync.split('\n  verify-and-deploy:\n')[1] ?? '';
+    const deployStep = deploy.indexOf('- name: Deploy verified artifact (production)');
+    for (const command of ['pnpm run typecheck', 'pnpm test', 'pnpm run build:frontend', 'pnpm exec wrangler deploy --dry-run', 'pnpm run test:e2e']) {
+      expect(deploy).toContain(`run: ${command}`);
+      expect(deploy.indexOf(`run: ${command}`)).toBeLessThan(deployStep);
+    }
+    expect(deploy).toContain("github.repository == 'xiongmx/CloudSSH'");
+    expect(deploy).toContain("github.event_name == 'pull_request'");
+    expect(deploy.slice(deployStep)).toMatch(/^        if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'$/m);
+    expect(deploy.slice(deployStep)).toContain('pnpm exec wrangler deploy --env=""');
+    expect(deploy.slice(0, deployStep)).not.toContain('secrets.');
+    expect(deploy.slice(deployStep)).toContain('secrets.CLOUDFLARE_API_TOKEN');
+    expect(deploy.slice(deployStep)).toContain('secrets.CLOUDFLARE_ACCOUNT_ID');
+
+    const wrangler = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
+    expect(wrangler).toContain('keep_vars = true');
+    expect(wrangler).not.toMatch(/^\[vars\]$/m);
+    expect(wrangler).not.toMatch(/^\[env\.[^\]]+\.vars\]$/m);
+    expect(wrangler).not.toMatch(/^\s*(?:REQUIRE_AUTH|ENABLE_SSH_SHARING)\s*=/m);
   });
 });
 
