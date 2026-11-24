@@ -353,18 +353,20 @@ describe('安全 — GitHub 用户白名单', () => {
   });
 });
 
-describe('安全 — 强制 GitHub 登录模式', () => {
+describe('安全 — 强制登录模式', () => {
   it.each([
     [undefined, false],
     ['false', false],
     ['true', true],
     ['ture', true],
-  ])('REQUIRE_GITHUB_AUTH=%s 时 /api/config 返回 %s', async (value, expected) => {
+    [' FALSE ', false],
+    ['', false],
+  ])('REQUIRE_AUTH=%s 时 /api/config 返回 %s', async (value, expected) => {
     const worker = await loadWorker();
     const res = await worker.fetch(
       makeRequest('/api/config'),
       makeEnv({
-        REQUIRE_GITHUB_AUTH: value,
+        REQUIRE_AUTH: value,
       })
     );
     expect(
@@ -375,7 +377,7 @@ describe('安全 — 强制 GitHub 登录模式', () => {
   it('强制登录时拒绝匿名 SSH WebSocket', async () => {
     const worker = await loadWorker();
     const sshSessionStub = makeDOStub(() => new Response('forwarded'));
-    const env = makeEnv({ REQUIRE_GITHUB_AUTH: 'true', sshSessionStub });
+    const env = makeEnv({ REQUIRE_AUTH: 'true', sshSessionStub });
     const req = makeRequest('/api/ssh', {
       headers: { Upgrade: 'websocket', Origin: 'https://cloudssh.test' },
     });
@@ -398,7 +400,7 @@ describe('安全 — 强制 GitHub 登录模式', () => {
     );
     const sshSessionStub = makeDOStub(() => new Response('forwarded'));
     const env = makeEnv({
-      REQUIRE_GITHUB_AUTH: 'true',
+      REQUIRE_AUTH: 'true',
       GITHUB_ALLOWED_USER_IDS: '42',
       userDbStub,
       sshSessionStub,
@@ -1168,7 +1170,7 @@ describe('安全 — 一次性 token 与接缝鉴权', () => {
     const userDbStub = makeDOStub(() =>
       Response.json({ error: 'not authenticated' }, { status: 401 })
     );
-    const env = makeEnv({ REQUIRE_GITHUB_AUTH: 'true', userDbStub });
+    const env = makeEnv({ REQUIRE_AUTH: 'true', userDbStub });
     const req = makeRequest('/api/ssh?token=987:one-time-token', {
       headers: { Upgrade: 'websocket', Origin: 'https://cloudssh.test' },
     });
@@ -1203,7 +1205,7 @@ describe('安全 — 一次性 token 与接缝鉴权', () => {
     });
     const sshSessionStub = makeDOStub(() => new Response('forwarded'));
     const env = makeEnv({
-      REQUIRE_GITHUB_AUTH: 'true',
+      REQUIRE_AUTH: 'true',
       userDbStub,
       sshSessionStub,
     });
@@ -1256,20 +1258,52 @@ describe('安全 — 一次性 token 与接缝鉴权', () => {
 });
 
 describe('安全 — 一次性 SSH 分享边界', () => {
-  it('分享功能默认关闭，仅显式配置 true 时公开', async () => {
+  it('分享默认关闭；显式启用后，未登录者仍不能创建或管理', async () => {
     const worker = await loadWorker();
-    const disabled = await worker.fetch(makeRequest('/api/config'), makeEnv());
-    expect(((await disabled.json()) as { sshSharingEnabled?: boolean }).sshSharingEnabled).toBe(
-      false
-    );
+    const disabledEnv = makeEnv();
+    const disabledConfig = await worker.fetch(makeRequest('/api/config'), disabledEnv);
+    expect(await disabledConfig.json()).toMatchObject({ sshSharingEnabled: false });
 
-    const enabled = await worker.fetch(
-      makeRequest('/api/config'),
-      makeEnv({ ENABLE_SSH_SHARING: 'true' })
+    const disabledClaim = await worker.fetch(
+      makeRequest('/api/share/claim', { method: 'POST', body: { token: 'a'.repeat(43) } }),
+      disabledEnv
     );
-    expect(((await enabled.json()) as { sshSharingEnabled?: boolean }).sshSharingEnabled).toBe(
-      true
+    const disabledOwnerRoute = await worker.fetch(
+      makeRequest('/api/shares/1', { method: 'DELETE' }),
+      disabledEnv
     );
+    const disabledSocket = await worker.fetch(
+      makeRequest(`/api/ssh?share_ref=${'r'.repeat(43)}&share_ticket=${'t'.repeat(43)}`, {
+        headers: { Upgrade: 'websocket', Origin: 'https://cloudssh.test' },
+      }),
+      disabledEnv
+    );
+    expect(disabledClaim.status).toBe(404);
+    expect(disabledOwnerRoute.status).toBe(404);
+    expect(disabledSocket.status).toBe(404);
+
+    const userDbStub = makeDOStub((request) =>
+      request.url.includes('/internal/session/verify')
+        ? Response.json({ id: 12, github_id: 987, username: 'alice', avatar_url: '' })
+        : Response.json({ error: 'unexpected request' }, { status: 500 })
+    );
+    const disabledCreate = await worker.fetch(
+      makeRequest('/api/servers/7/shares', {
+        method: 'POST',
+        cookies: { session: '987:legit-session' },
+        body: { expiresInMinutes: 15, maxSessionMinutes: 60 },
+      }),
+      makeEnv({ ENABLE_SSH_SHARING: 'false', userDbStub })
+    );
+    expect(disabledCreate.status).toBe(404);
+
+    const enabledEnv = makeEnv({ ENABLE_SSH_SHARING: 'true' });
+    const enabledConfig = await worker.fetch(makeRequest('/api/config'), enabledEnv);
+    expect(await enabledConfig.json()).toMatchObject({ sshSharingEnabled: true });
+    for (const [path, method] of [['/api/servers/1/shares', 'POST'], ['/api/shares/1', 'DELETE']]) {
+      const response = await worker.fetch(makeRequest(path, { method }), enabledEnv);
+      expect(response.status).toBe(401);
+    }
   });
 
   it('公开领取接口对非法 JSON 和非 URL-safe 凭证返回 400', async () => {
@@ -1424,7 +1458,7 @@ describe('安全 — 一次性 SSH 分享边界', () => {
     });
     const env = makeEnv({
       ENABLE_SSH_SHARING: 'true',
-      REQUIRE_GITHUB_AUTH: 'true',
+      REQUIRE_AUTH: 'true',
       sshShareStub: shareStub,
       sshSessionStub: sessionStub,
     });
@@ -1453,14 +1487,17 @@ describe('安全 — 一次性 SSH 分享边界', () => {
     );
   });
 
-  it('分享功能关闭时拒绝领取和分享 WebSocket', async () => {
+  it('显式启用分享后仍须经 ShareDO 核验凭证，拒绝时不启动 SSH 会话', async () => {
     const worker = await loadWorker();
+    const sshShareStub = makeDOStub(() => new Response(null, { status: 404 }));
+    const sshSessionStub = makeDOStub(() => new Response());
+    const env = makeEnv({ ENABLE_SSH_SHARING: 'true', sshShareStub, sshSessionStub });
     const claim = await worker.fetch(
       makeRequest('/api/share/claim', {
         method: 'POST',
         body: { token: 'a'.repeat(43) },
       }),
-      makeEnv()
+      env
     );
     expect(claim.status).toBe(404);
 
@@ -1468,9 +1505,13 @@ describe('安全 — 一次性 SSH 分享边界', () => {
       makeRequest(`/api/ssh?share_ref=${'r'.repeat(43)}&share_ticket=${'t'.repeat(43)}`, {
         headers: { Upgrade: 'websocket', Origin: 'https://cloudssh.test' },
       }),
-      makeEnv()
+      env
     );
     expect(socket.status).toBe(404);
+    expect(sshShareStub.fetch.mock.calls.map(([req]) => new URL(req.url).pathname)).toEqual([
+      '/internal/claim', '/internal/connect/consume',
+    ]);
+    expect(sshSessionStub.fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -1576,7 +1617,6 @@ describe('安全 — SSH 身份字段信任边界', () => {
       {} as WebSocket,
       {} as any,
       { host: 'ssh.example.com', port: 22, username: 'alice', password: 'secret' },
-      true,
       false,
       undefined,
       env,

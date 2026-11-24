@@ -21,7 +21,7 @@ import {
   handleGitHubCallback,
   handleLogout,
   handlePasswordLogin,
-  isGitHubAuthRequired,
+  isAuthRequired,
   isSshIdentityAllowed,
   getPasswordAuthParams,
   parseAdminPasswordHash,
@@ -34,6 +34,7 @@ import { createHtmlResponse } from './html-cache';
 import { handleVersionCheck } from './version-check';
 import { handleCloudflareSshCaSign } from './cf-ssh-ca';
 import { handleMcp, handleMcpManagement } from './mcp';
+import { handleRdp, isRdpRoute, type RdpAssets } from './rdp-routes';
 export { MCPExecutionDO } from './mcp-execution';
 
 export { SSHSessionDO } from './durable-object';
@@ -185,7 +186,8 @@ export default {
   async fetch(
     request: Request,
     env: Env,
-    ctx?: Pick<ExecutionContext, 'access'>
+    ctx?: Pick<ExecutionContext, 'access'> & Partial<Pick<ExecutionContext, 'waitUntil'>>,
+    rdpAssets?: RdpAssets,
   ): Promise<Response> {
     try {
       await initializeAccessIdentity(request, ctx);
@@ -200,6 +202,10 @@ export default {
         }
       }
 
+      if (isRdpRoute(url.pathname)) return await handleRdp(request, url, env, rdpAssets, ctx);
+      if (url.pathname === '/__rdp-preview' || url.pathname.startsWith('/__rdp-preview/')) {
+        return new Response(null, { status: 404, headers: { 'Cache-Control': 'no-store' } });
+      }
       if (url.pathname === '/mcp') return await handleMcp(request, env);
       if (url.pathname.startsWith('/api/mcp/')) {
         const response = await handleMcpManagement(request, env);
@@ -409,11 +415,12 @@ export default {
           sitekey: env.TURNSTILE_SITEKEY || '',
           // 密码模式/CF Access 模式下 GitHub 入口被禁用
           githubAuthEnabled: authMode === 'github',
-          githubAuthRequired: isGitHubAuthRequired(env) || authMode === 'cf_access',
+          // 保留现有 /api/config 字段名以兼容已加载的前端。
+          githubAuthRequired: isAuthRequired(env) || authMode === 'cf_access',
           sshSharingEnabled: isSSHSharingEnabled(env),
+          ...(rdpAssets && url.protocol === 'https:' ? { rdpEnabled: true } : {}),
           authMode,
           cfAccessEmail,
-          cfAccessTeamName: env.CF_ACCESS_TEAM_NAME || '',
           // 浏览器预拉伸公开参数（盐非机密）；坏哈希时为 null
           passwordAuth: authMode === 'password' ? getPasswordAuthParams(env) : null,
           passwordHashInvalid:
@@ -421,6 +428,13 @@ export default {
         });
       }
 
+      if (rdpAssets && url.protocol === 'https:' && request.method === 'GET' &&
+          url.pathname === '/' && [...url.searchParams.keys()].every(key => key === 'lang')) {
+        // Keep the list and RDP frame in the same document. Never isolate the login flow on
+        // the strength of a cookie alone. Bootstrap and every RDP resource still recheck access.
+        const owner = await getAuthenticatedUser(request, env).catch(() => null);
+        return createHtmlResponse(request, owner ? 'account' : 'public');
+      }
       return createHtmlResponse(request);
     } catch {
       console.error('Worker request failed');
@@ -1250,7 +1264,7 @@ async function handleSSHConnection(request: Request, env: Env): Promise<Response
     return new Response('Forbidden', { status: 403 });
   }
 
-  if ((isGitHubAuthRequired(env) || resolveAuthMode(env, request) === 'cf_access') &&
+  if ((isAuthRequired(env) || resolveAuthMode(env, request) === 'cf_access') &&
       !(await getAuthenticatedUser(request, env))) {
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
@@ -1294,7 +1308,7 @@ async function handleResumeSSHConnection(
   }
 
   const accessMode = resolveAuthMode(env, request) === 'cf_access';
-  const loginRequired = isGitHubAuthRequired(env) || accessMode;
+  const loginRequired = isAuthRequired(env) || accessMode;
   const authenticated = loginRequired ? await getAuthenticatedUser(request, env) : null;
   // Access lookup failures remain fail-closed. A public share recipient, however,
   // may resume only a device-bound share; the DO checks its actual stored policy.
@@ -1369,7 +1383,6 @@ async function handleShareClaim(request: Request, url: URL, env: Env): Promise<R
     sessionExpiresAt: claim.sessionExpiresAt,
   });
 }
-
 async function handleShareOwnerRoute(request: Request, url: URL, env: Env): Promise<Response> {
   if (!isSSHSharingEnabled(env)) {
     return Response.json({ error: 'SSH sharing is disabled' }, { status: 404 });
@@ -1502,7 +1515,7 @@ async function handleTokenSSHConnection(
   }
 
   const authMode = resolveAuthMode(env, request);
-  const loginRequired = isGitHubAuthRequired(env) || authMode === 'cf_access';
+  const loginRequired = isAuthRequired(env) || authMode === 'cf_access';
   const authenticatedUser = loginRequired ? await getAuthenticatedUser(request, env) : null;
   if (loginRequired && !authenticatedUser) {
     return Response.json({ error: 'Authentication required' }, { status: 401 });

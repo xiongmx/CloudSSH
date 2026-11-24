@@ -138,7 +138,6 @@ function createShareSession(expiresAt: number): { session: SSHSession; socket: {
         sessionExpiresAt: expiresAt,
       },
     },
-    true,
     false,
     SFTP_URL,
     undefined,
@@ -155,7 +154,6 @@ function createRegularSession(): { session: SSHSession; socket: { close: any } }
     ws as unknown as WebSocket,
     socket as never,
     { host: 'ssh.example.com', port: 22, username: 'alice', password: 'secret', authMethod: 'password' },
-    true,
     false,
     SFTP_URL,
     undefined,
@@ -224,7 +222,7 @@ describe('SSHSessionDO Share Resume Device-Binding Security', () => {
       if (scenario === 'signed-in-regular') headers.set('Cookie', 'session=123:valid-session');
       const forward = vi.fn((request: Request) => doInstance.fetch(request));
       const env = {
-        REQUIRE_GITHUB_AUTH: 'true',
+        REQUIRE_AUTH: 'true',
         ...(scenario === 'access-without-identity' ? { CF_ACCESS: 'true' } : {}),
         SSH_SESSION: { idFromName: () => SESSION_ID, get: () => ({ fetch: forward }) },
         USER_DB: { idFromName: () => 'user', get: () => ({

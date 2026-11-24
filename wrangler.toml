@@ -1,19 +1,16 @@
 name = "cloudssh"
-main = "src/worker/index.ts"
+main = "src/worker/rdp-entry.ts"
 compatibility_date = "2026-07-01"
 workers_dev = true
 
 [vars]
 DEBUG_MODE = "false"
-# 一次性受控 SSH 分享：随部署默认启用（Git 集成/CLI 部署即生效，生产与 test 环境均置 true）。
-# 关闭改为 "false" 或删除本行；Dashboard 手动上传部署不受 [vars] 影响，如需启用需自行添加该变量。
+# Fork 安全策略：默认关闭一次性 SSH 分享；需同时修改服务端策略才能启用。
 ENABLE_SSH_SHARING = "false"
 # 用户无操作空闲超时：默认 30 分钟（支持 30m / 1h / 1800s / 纯数字按秒）；设为 "0" 禁用
 IDLE_TIMEOUT = "30m"
-# 是否强制登录后才能使用 SSH（GitHub 或单管理员密码会话均满足）；"false" 保持匿名直连可用
-REQUIRE_GITHUB_AUTH = "true"
-# SSH 远端主机公钥签名严格校验：默认 fail-closed；仅本地调试老旧服务器时才允许 "false"
-STRICT_HOST_KEY_VERIFY = "true"
+# Fork 安全策略：普通 SSH 必须登录后才能使用。上游 v2.12.1 将变量改名为 REQUIRE_AUTH。
+REQUIRE_AUTH = "true"
 
 # 构建监视路径：仅源代码变动时触发重新构建
 [build]
@@ -58,6 +55,18 @@ new_sqlite_classes = ["SSHShareDO"]
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["MCPExecutionDO"]
+
+# 浏览器 RDP 资源与 SSH 内联 HTML 分离；避免 Static Assets 路由改变原生 Access 上下文。
+[[rules]]
+type = "Data"
+globs = ["**/*.rdp-bin"]
+fallthrough = true
+
+[[rules]]
+type = "Text"
+globs = ["**/*.rdp-text"]
+fallthrough = true
+
 # ========== Test 环境 ==========
 # test 分支部署到独立 Worker；DO 类绑定相同，但实例与数据和生产环境隔离
 # 自定义域名请在 Cloudflare Dashboard 中手动绑定
@@ -66,11 +75,9 @@ name = "cloudssh-test"
 
 [env.test.vars]
 DEBUG_MODE = "true"
-ENABLE_SSH_SHARING = "true"
+ENABLE_SSH_SHARING = "false"
 IDLE_TIMEOUT = "30m"
-# test 环境默认要求登录（验证强制登录链路）；生产 [vars] 保持 "false" 匿名可用
-REQUIRE_GITHUB_AUTH = "true"
-STRICT_HOST_KEY_VERIFY = "true"
+REQUIRE_AUTH = "true"
 
 [[env.test.durable_objects.bindings]]
 name = "SSH_SESSION"
@@ -83,6 +90,7 @@ class_name = "UserDBDO"
 [[env.test.durable_objects.bindings]]
 name = "SSH_SHARE"
 class_name = "SSHShareDO"
+
 [[env.test.durable_objects.bindings]]
 name = "MCP_EXECUTION"
 class_name = "MCPExecutionDO"
