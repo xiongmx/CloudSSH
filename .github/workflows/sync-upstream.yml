@@ -30,30 +30,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  probe-sync-app:
-    name: Probe sync app permissions
-    if: github.repository == 'xiongmx/CloudSSH' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/cue/auto-sync-preserve-worker-vars'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - name: Create scoped GitHub App token
-        id: token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
-        with:
-          app-id: ${{ secrets.CLOUDSSH_SYNC_APP_ID }}
-          private-key: ${{ secrets.CLOUDSSH_SYNC_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: CloudSSH
-          permission-contents: write
-      - name: Check granted repository permissions
-        env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
-        run: |
-          set -euo pipefail
-          gh api installation --jq '{app_slug, permissions: {contents: .permissions.contents, pull_requests: .permissions.pull_requests}}'
-
   sync:
     name: Prepare upstream candidate PR
     if: >-
