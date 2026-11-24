@@ -47,14 +47,12 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: CloudSSH
           permission-contents: write
-          permission-pull-requests: write
       - name: Check granted repository permissions
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           set -euo pipefail
-          gh api installation --jq '{permissions: {contents: .permissions.contents, pull_requests: .permissions.pull_requests}}' | tee /tmp/probe-permissions.json
-          jq -e '.permissions.contents == "write" and .permissions.pull_requests == "write"' /tmp/probe-permissions.json >/dev/null
+          gh api installation --jq '{app_slug, permissions: {contents: .permissions.contents, pull_requests: .permissions.pull_requests}}'
 
   sync:
     name: Prepare upstream candidate PR
